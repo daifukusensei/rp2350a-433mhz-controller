@@ -146,6 +146,57 @@ def parse_report(buf, has_id):
     return buf[0], [k for k in buf[2:8] if k]
 
 # ==============================================================================
+# HOLD DETECTION
+# Tracks when the current set of keys was first pressed so we can light the
+# LED solid yellow after HOLD_THRESHOLD_S seconds of continuous hold.
+# The yellow LED stays on until the key(s) change (i.e. any new press).
+# ==============================================================================
+HOLD_THRESHOLD_S = 4.0
+
+hold_start_time  = None   # monotonic timestamp of when current keys went down
+hold_yellow_active = False  # True while the "held 4 s" yellow LED is lit
+
+def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
+    """
+    Call once per report (after change detection).
+    keycodes / prev_keycodes are already-parsed lists.
+    Returns nothing; manages hold_start_time and hold_yellow_active globals
+    and drives the LED directly.
+
+    LED behaviour:
+      - Lights solid yellow once a key has been held for HOLD_THRESHOLD_S.
+      - Stays yellow even after the key is released.
+      - Turns off (and timer resets) only when a new key is pressed.
+    """
+    global hold_start_time, hold_yellow_active
+
+    keys_now  = (modifier, tuple(sorted(keycodes)))
+    keys_prev = (prev_modifier, tuple(sorted(prev_keycodes)))
+
+    # --- State changed -------------------------------------------------------
+    if keys_now != keys_prev:
+        if keycodes:
+            # One or more keys are now down -- this counts as a new press.
+            # Cancel any active yellow LED and restart the hold timer.
+            if hold_yellow_active:
+                hold_yellow_active = False
+                led_off()
+                print("New key press: LED cleared")
+            hold_start_time = time.monotonic()
+        # If keycodes is empty the user just released; leave the LED and
+        # timer completely untouched so the yellow stays lit if it was on.
+        return
+
+    # --- Same keys still held -- check duration ------------------------------
+    # Guard: only meaningful while at least one key is physically down.
+    if keycodes and hold_start_time is not None and not hold_yellow_active:
+        held_for = time.monotonic() - hold_start_time
+        if held_for >= HOLD_THRESHOLD_S:
+            hold_yellow_active = True
+            led(50, 50, 0)   # solid yellow (NeoPixel order is G, R, B)
+            print("Key held for 4 s: LED solid yellow")
+
+# ==============================================================================
 # MAIN LOOP
 # ==============================================================================
 print("Starting -- waiting for USB keyboard on host port...")
@@ -169,22 +220,32 @@ while True:
     try:
         kbd_dev.read(hid_endpoint, buf, timeout=10)
     except usb.core.USBTimeoutError:
-        continue
+        # Even on timeout we need to check whether a held key has crossed the
+        # 4-second threshold, so fall through using the unchanged buffer.
+        pass
     except Exception as e:
         print("Read error (disconnected?):", e)
-        kbd_dev      = None
-        hid_endpoint = None
+        kbd_dev        = None
+        hid_endpoint   = None
+        hold_start_time = None
+        hold_yellow_active = False
         led_off()
         continue
 
-    # Skip if state unchanged
     modifier,      keycodes      = parse_report(buf,      report_has_id)
     prev_modifier, prev_keycodes = parse_report(prev_buf, report_has_id)
+
+    # --- Hold-state update (runs every loop iteration, not just on change) ---
+    # Pass current vs previous so the function can detect transitions AND
+    # check elapsed time on unchanged holds.
+    update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier)
+
+    # Skip the rest if nothing changed
     if modifier == prev_modifier and keycodes == prev_keycodes:
         continue
     prev_buf[:] = buf
 
-    # Dispatch custom actions
+    # Dispatch custom actions on newly pressed keys
     for kc in keycodes:
         action = CUSTOM_ACTIONS.get((modifier, kc))
         if action:

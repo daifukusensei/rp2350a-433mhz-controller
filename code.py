@@ -8,11 +8,17 @@ Requires in /lib:
 Requires boot.py on CIRCUITPY root:
   import usb_host, board
   usb_host.Port(board.GP12, board.GP13)
+
+433 MHz wiring:
+  RX data pin -> GP28
+  TX data pin -> GP29  (change RF_TX_PIN below if different)
 """
 
+import array
 import board
 import time
 import neopixel
+import pulseio
 import usb.core
 
 # ==============================================================================
@@ -38,6 +44,33 @@ flash_led(50, 50, 50, times=1)   # white = alive
 flash_led(0, 0, 50, times=5)     # blue = headless
 
 # ==============================================================================
+# 433 MHz CONFIG
+# ==============================================================================
+RF_RX_PIN           = board.GP28
+RF_TX_PIN           = board.GP29
+
+RF_CARRIER_HZ       = 433_920      # standard 433.92 MHz carrier for OOK modules
+RF_RECORD_TIMEOUT_S  = 10.0        # give up listening after this many seconds
+RF_RX_MAXLEN         = 512         # pulse buffer depth (must be power of 2)
+RF_PULSE_MIN_US      = 200         # pulses shorter than this are always noise (µs)
+RF_PULSE_MAX_US      = 20_000      # pulses longer than this are always noise (µs)
+# Consistency-based signal detection.
+# A real OOK remote sends pulses of only 2-3 fixed widths; noise is random.
+# We bucket pulse widths (resolution RF_BUCKET_US) and require that the top
+# RF_CONSIST_BUCKETS buckets account for at least RF_CONSIST_RATIO of all
+# valid pulses AND that at least RF_CONSIST_MIN_PULSES valid pulses arrived.
+RF_BURST_WINDOW_S     = 0.15       # detection sample window in seconds (150 ms)
+RF_CONSIST_MIN_PULSES = 20         # minimum valid pulses required in detection window
+RF_BUCKET_US          = 50         # pulse-width bucket resolution (µs)
+RF_CONSIST_BUCKETS    = 3          # top N buckets that must dominate
+RF_CONSIST_RATIO      = 0.70       # fraction of pulses that must fall in top buckets
+RF_CAPTURE_WINDOW_S   = 0.35       # how long to record after signal detected (ms)
+RF_REPLAY_TIMES       = 5          # number of times to repeat transmission
+
+# Keyed by (modifier_byte, keycode_byte), value is an array.array('H', pulses)
+RF_SIGNALS = {}
+
+# ==============================================================================
 # MODIFIER BITMASKS
 # ==============================================================================
 MOD_LCTRL  = 0x01
@@ -55,16 +88,133 @@ MOD_RGUI   = 0x80
 # Format: (modifier_byte, keycode_byte): function
 #   modifier_byte  combine MOD_* constants, or 0x00 for none
 #   keycode_byte   raw HID usage ID  (A=0x04, F1=0x3A, ScrollLock=0x47 ...)
+#
+# Note: if a key also has an RF_SIGNALS entry, the RF replay takes priority
+# and the CUSTOM_ACTIONS entry is skipped for that key.
 # ==============================================================================
 CUSTOM_ACTIONS = {
     (0x00, 0x04): lambda: flash_led(50, 0, 0, times=3), # A -> flash LED green
-	(0x00, 0x05): lambda: flash_led(0, 50, 0, times=3), # B -> flash LED red
-	(0x00, 0x06): lambda: flash_led(0, 0, 50, times=3), # C -> flash LED blue
+    (0x00, 0x05): lambda: flash_led(0, 50, 0, times=3), # B -> flash LED red
+    (0x00, 0x06): lambda: flash_led(0, 0, 50, times=3), # C -> flash LED blue
 
     # Stubs for future local-hardware actions:
     # (0x00, 0x3B): action_433_send,    # F2 -> transmit 433 MHz code
     # (0x00, 0x3C): action_gpio_toggle, # F3 -> toggle GPIO pin
 }
+
+# ==============================================================================
+# 433 MHz RECORD
+# Blocking call -- runs while the yellow LED is active and waits for a signal.
+# On success: stores pulses in RF_SIGNALS, two yellow flashes, LED off.
+# On timeout: three red flashes, LED off.
+# Either way clears hold_yellow_active and recording_key before returning.
+# ==============================================================================
+def record_433_signal(key_combo):
+    global hold_yellow_active, recording_key
+
+    print("RF record: listening on GP28 for key", key_combo,
+          "(timeout", RF_RECORD_TIMEOUT_S, "s)...")
+    led(50, 50, 0)  # keep yellow while listening
+
+    rx = pulseio.PulseIn(RF_RX_PIN, maxlen=RF_RX_MAXLEN, idle_state=False)
+    rx.pause()
+    rx.clear()
+    # Settling pause: let the receiver AGC stabilise, then discard whatever
+    # noise drifted in during that time before we start burst detection.
+    time.sleep(0.2)
+    rx.clear()
+    rx.resume()
+
+    deadline = time.monotonic() + RF_RECORD_TIMEOUT_S
+    captured = None
+
+    try:
+        while time.monotonic() < deadline:
+            # --- Consistency-based signal detection --------------------------
+            # Pure noise is randomly distributed across the valid width range.
+            # A real OOK remote sends pulses of only 2-3 fixed widths, so the
+            # pulse-width histogram is strongly peaked.  We sample a short
+            # window, bucket the widths, and check whether the top few buckets
+            # account for >= RF_CONSIST_RATIO of all valid pulses.
+            rx.clear()
+            time.sleep(RF_BURST_WINDOW_S)
+            raw   = [rx[i] for i in range(len(rx))]
+            valid = [p for p in raw if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US]
+
+            if len(valid) >= RF_CONSIST_MIN_PULSES:
+                # Build a bucket histogram keyed by (width // RF_BUCKET_US)
+                buckets = {}
+                for p in valid:
+                    k = p // RF_BUCKET_US
+                    buckets[k] = buckets.get(k, 0) + 1
+                top_counts = sorted(buckets.values(), reverse=True)[:RF_CONSIST_BUCKETS]
+                ratio = sum(top_counts) / len(valid)
+                print("RF window:", len(valid), "valid pulses, top-bucket ratio:", ratio)
+
+                if ratio >= RF_CONSIST_RATIO:
+                    # Real signal confirmed. Do a clean unfiltered capture now:
+                    # filtering individual pulses mid-sequence would destroy the
+                    # alternating on/off structure that PulseOut depends on.
+                    # Instead capture the raw burst and only strip leading noise
+                    # (pulses before the first width-valid pulse).
+                    rx.clear()
+                    time.sleep(RF_CAPTURE_WINDOW_S)
+                    raw = [rx[i] for i in range(len(rx))]
+                    # Find first and last pulse within valid width range to trim
+                    # leading/trailing noise without breaking internal structure.
+                    first = None
+                    for i, p in enumerate(raw):
+                        if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
+                            first = i
+                            break
+                    last = None
+                    for i, p in enumerate(reversed(raw)):
+                        if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
+                            last = i
+                            break
+                    if first is not None and last is not None:
+                        trimmed = raw[first: len(raw) - last]
+                        captured = array.array('H')
+                        for p in trimmed:
+                            captured.append(p)
+                    break
+            else:
+                print("RF window:", len(valid), "valid pulses (too few, waiting...)")
+    finally:
+        rx.pause()
+        rx.deinit()
+
+    hold_yellow_active = False
+    recording_key      = None
+
+    if captured is not None:
+        RF_SIGNALS[key_combo] = captured
+        print("RF record: captured", len(captured), "pulses -> saved to", key_combo)
+        flash_led(50, 50, 0, times=2)  # two yellow flashes = success
+    else:
+        print("RF record: timeout -- no signal detected")
+        flash_led(0, 50, 0, times=3)   # three red flashes = failure
+
+    led_off()
+
+# ==============================================================================
+# 433 MHz REPLAY
+# Transmits a previously recorded pulse train on RF_TX_PIN.
+# ==============================================================================
+def replay_433_signal(pulses):
+    print("RF replay:", len(pulses), "pulses,", RF_REPLAY_TIMES, "times")
+    led(0, 0, 50)  # brief blue while transmitting
+    try:
+        tx = pulseio.PulseOut(RF_TX_PIN, frequency=RF_CARRIER_HZ,
+                              duty_cycle=0x8000)
+        for _ in range(RF_REPLAY_TIMES):
+            tx.send(pulses)
+            # Small gap between repeats mimics how real remotes transmit.
+            time.sleep(0.01)
+        tx.deinit()
+    except Exception as e:
+        print("RF replay error:", e)
+    led_off()
 
 # ==============================================================================
 # ENDPOINT AUTO-DETECTION
@@ -131,8 +281,8 @@ def connect_keyboard():
     # Stage 3: endpoint detection
     ep, has_id = detect_endpoint(dev)
 
-    # Stage 4: ready (two green flashes)
-    flash_led(50, 0, 0, times=2)
+    # Stage 4: ready (two yellow flashes)
+    flash_led(50, 50, 0, times=2)
     prev_buf[:] = bytearray(8)
     print("Connected: endpoint", hex(ep), "report_has_id:", has_id)
     return dev, ep, has_id
@@ -150,11 +300,14 @@ def parse_report(buf, has_id):
 # Tracks when the current set of keys was first pressed so we can light the
 # LED solid yellow after HOLD_THRESHOLD_S seconds of continuous hold.
 # The yellow LED stays on until the key(s) change (i.e. any new press).
+# When yellow activates, recording_key is set so the main loop triggers RF
+# capture for that key combo.
 # ==============================================================================
 HOLD_THRESHOLD_S = 4.0
 
-hold_start_time  = None   # monotonic timestamp of when current keys went down
+hold_start_time    = None   # monotonic timestamp of when current keys went down
 hold_yellow_active = False  # True while the "held 4 s" yellow LED is lit
+recording_key      = None   # (modifier, kc) waiting to be recorded, or None
 
 def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
     """
@@ -168,7 +321,7 @@ def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
       - Stays yellow even after the key is released.
       - Turns off (and timer resets) only when a new key is pressed.
     """
-    global hold_start_time, hold_yellow_active
+    global hold_start_time, hold_yellow_active, recording_key
 
     keys_now  = (modifier, tuple(sorted(keycodes)))
     keys_prev = (prev_modifier, tuple(sorted(prev_keycodes)))
@@ -180,11 +333,12 @@ def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
             # Cancel any active yellow LED and restart the hold timer.
             if hold_yellow_active:
                 hold_yellow_active = False
+                recording_key      = None
                 led_off()
                 print("New key press: LED cleared")
             hold_start_time = time.monotonic()
         # If keycodes is empty the user just released; leave the LED and
-        # timer completely untouched so the yellow stays lit if it was on.
+        # timer completely untouched so yellow stays lit if it was on.
         return
 
     # --- Same keys still held -- check duration ------------------------------
@@ -193,8 +347,12 @@ def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
         held_for = time.monotonic() - hold_start_time
         if held_for >= HOLD_THRESHOLD_S:
             hold_yellow_active = True
-            led(50, 50, 0)   # solid yellow (NeoPixel order is G, R, B)
-            print("Key held for 4 s: LED solid yellow")
+            # Record against the first (lowest) keycode so the mapping is
+            # always a single (modifier, kc) pair.
+            recording_key = (modifier, min(keycodes))
+            led(50, 50, 0)  # solid yellow
+            print("Key held for 4 s: LED solid yellow, will record RF for",
+                  recording_key)
 
 # ==============================================================================
 # MAIN LOOP
@@ -216,6 +374,19 @@ while True:
             time.sleep(0.5)
             continue
 
+    # --------------------------------------------------------------------------
+    # RF RECORDING (blocking) -- entered only when hold_yellow_active just fired.
+    # Handled before the next USB read so the yellow LED stays on uninterrupted
+    # while we wait for the incoming RF signal.
+    # --------------------------------------------------------------------------
+    if recording_key is not None:
+        record_433_signal(recording_key)
+        # recording_key and hold_yellow_active are cleared inside the function.
+        # Flush prev_buf so the key-release that follows doesn't look like a
+        # spurious state change.
+        prev_buf[:] = bytearray(8)
+        continue
+
     # Read one HID report (10 ms timeout)
     try:
         kbd_dev.read(hid_endpoint, buf, timeout=10)
@@ -225,28 +396,31 @@ while True:
         pass
     except Exception as e:
         print("Read error (disconnected?):", e)
-        kbd_dev        = None
-        hid_endpoint   = None
-        hold_start_time = None
+        kbd_dev            = None
+        hid_endpoint       = None
+        hold_start_time    = None
         hold_yellow_active = False
+        recording_key      = None
         led_off()
         continue
 
     modifier,      keycodes      = parse_report(buf,      report_has_id)
     prev_modifier, prev_keycodes = parse_report(prev_buf, report_has_id)
 
-    # --- Hold-state update (runs every loop iteration, not just on change) ---
-    # Pass current vs previous so the function can detect transitions AND
-    # check elapsed time on unchanged holds.
+    # Hold-state update (runs every loop iteration, not just on change)
     update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier)
 
-    # Skip the rest if nothing changed
+    # Skip dispatch if nothing changed
     if modifier == prev_modifier and keycodes == prev_keycodes:
         continue
     prev_buf[:] = buf
 
-    # Dispatch custom actions on newly pressed keys
+    # Dispatch: RF replay takes priority over CUSTOM_ACTIONS for the same key
     for kc in keycodes:
-        action = CUSTOM_ACTIONS.get((modifier, kc))
-        if action:
-            action()
+        key_combo = (modifier, kc)
+        if key_combo in RF_SIGNALS:
+            replay_433_signal(RF_SIGNALS[key_combo])
+        else:
+            action = CUSTOM_ACTIONS.get(key_combo)
+            if action:
+                action()

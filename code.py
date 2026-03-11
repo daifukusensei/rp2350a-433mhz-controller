@@ -19,6 +19,7 @@ import board
 import time
 import neopixel
 import pulseio
+import supervisor
 import usb.core
 
 # ==============================================================================
@@ -31,6 +32,12 @@ def led(g, r, b):
 
 def led_off():
     np[0] = (0, 0, 0)
+
+def debug(*args, **kwargs):
+    """Print only when a serial terminal is actively connected.
+    Headless / 5 V-supply operation: CDC TX buffer never fills, no stalling."""
+    if supervisor.runtime.serial_connected:
+        print(*args, **kwargs)
 
 def flash_led(g, r, b, times=3, on_ms=80, off_ms=80):
     for _ in range(times):
@@ -50,9 +57,9 @@ RF_RX_PIN           = board.GP28
 RF_TX_PIN           = board.GP29
 
 RF_CARRIER_HZ       = 433_920      # standard 433.92 MHz carrier for OOK modules
-RF_RECORD_TIMEOUT_S  = 10.0        # give up listening after this many seconds
+RF_RECORD_TIMEOUT_S  = 60.0        # give up listening after this many seconds
 RF_RX_MAXLEN         = 512         # pulse buffer depth (must be power of 2)
-RF_PULSE_MIN_US      = 200         # pulses shorter than this are always noise (µs)
+RF_PULSE_MIN_US      = 500         # pulses shorter than this are always noise (µs)
 RF_PULSE_MAX_US      = 20_000      # pulses longer than this are always noise (µs)
 # Consistency-based signal detection.
 # A real OOK remote sends pulses of only 2-3 fixed widths; noise is random.
@@ -64,8 +71,10 @@ RF_CONSIST_MIN_PULSES = 20         # minimum valid pulses required in detection 
 RF_BUCKET_US          = 50         # pulse-width bucket resolution (µs)
 RF_CONSIST_BUCKETS    = 3          # top N buckets that must dominate
 RF_CONSIST_RATIO      = 0.70       # fraction of pulses that must fall in top buckets
+RF_CONSIST_CONFIRMATIONS = 10       # consecutive passing windows required before capture
+                                   # (prevents switching-supply noise false positives)
 RF_CAPTURE_WINDOW_S   = 0.35       # how long to record after signal detected (ms)
-RF_REPLAY_TIMES       = 5          # number of times to repeat transmission
+RF_REPLAY_TIMES       = 1          # number of times to repeat transmission
 
 # Keyed by (modifier_byte, keycode_byte), value is an array.array('H', pulses)
 RF_SIGNALS = {}
@@ -112,7 +121,7 @@ CUSTOM_ACTIONS = {
 def record_433_signal(key_combo):
     global hold_yellow_active, recording_key
 
-    print("RF record: listening on GP28 for key", key_combo,
+    debug("RF record: listening on GP28 for key", key_combo,
           "(timeout", RF_RECORD_TIMEOUT_S, "s)...")
     led(50, 50, 0)  # keep yellow while listening
 
@@ -127,6 +136,8 @@ def record_433_signal(key_combo):
 
     deadline = time.monotonic() + RF_RECORD_TIMEOUT_S
     captured = None
+    exc_info = None
+    confirm  = 0          # consecutive windows that passed the consistency check
 
     try:
         while time.monotonic() < deadline:
@@ -136,6 +147,11 @@ def record_433_signal(key_combo):
             # pulse-width histogram is strongly peaked.  We sample a short
             # window, bucket the widths, and check whether the top few buckets
             # account for >= RF_CONSIST_RATIO of all valid pulses.
+            #
+            # We also require RF_CONSIST_CONFIRMATIONS consecutive passing
+            # windows before accepting.  Switching-supply noise can satisfy
+            # the histogram test in a single window but won't do so repeatedly
+            # at the same pulse widths; real remotes repeat their code.
             rx.clear()
             time.sleep(RF_BURST_WINDOW_S)
             raw   = [rx[i] for i in range(len(rx))]
@@ -149,37 +165,53 @@ def record_433_signal(key_combo):
                     buckets[k] = buckets.get(k, 0) + 1
                 top_counts = sorted(buckets.values(), reverse=True)[:RF_CONSIST_BUCKETS]
                 ratio = sum(top_counts) / len(valid)
-                print("RF window:", len(valid), "valid pulses, top-bucket ratio:", ratio)
 
                 if ratio >= RF_CONSIST_RATIO:
-                    # Real signal confirmed. Do a clean unfiltered capture now:
-                    # filtering individual pulses mid-sequence would destroy the
-                    # alternating on/off structure that PulseOut depends on.
-                    # Instead capture the raw burst and only strip leading noise
-                    # (pulses before the first width-valid pulse).
-                    rx.clear()
-                    time.sleep(RF_CAPTURE_WINDOW_S)
-                    raw = [rx[i] for i in range(len(rx))]
-                    # Find first and last pulse within valid width range to trim
-                    # leading/trailing noise without breaking internal structure.
-                    first = None
-                    for i, p in enumerate(raw):
-                        if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
-                            first = i
-                            break
-                    last = None
-                    for i, p in enumerate(reversed(raw)):
-                        if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
-                            last = i
-                            break
-                    if first is not None and last is not None:
-                        trimmed = raw[first: len(raw) - last]
-                        captured = array.array('H')
-                        for p in trimmed:
-                            captured.append(p)
-                    break
+                    confirm += 1
+                    debug("RF window:", len(valid), "valid pulses, ratio:", ratio,
+                          "confirm:", confirm, "/", RF_CONSIST_CONFIRMATIONS)
+                else:
+                    confirm = 0
+                    debug("RF window:", len(valid), "valid pulses, ratio:", ratio,
+                          "(below threshold, resetting)")
             else:
-                print("RF window:", len(valid), "valid pulses (too few, waiting...)")
+                confirm = 0
+                debug("RF window:", len(valid), "valid pulses (too few, waiting...)")
+
+            if confirm >= RF_CONSIST_CONFIRMATIONS:
+                # Real signal confirmed across multiple windows.
+                # The buffer already holds the most recent detection window --
+                # extend by RF_CAPTURE_WINDOW_S to catch any trailing pulses.
+                time.sleep(RF_CAPTURE_WINDOW_S)
+                raw = [rx[i] for i in range(len(rx))]
+                # Trim leading/trailing out-of-range pulses (noise) without
+                # disrupting the alternating on/off structure PulseOut needs.
+                first = None
+                for i, p in enumerate(raw):
+                    if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
+                        first = i
+                        break
+                last = None
+                for i, p in enumerate(reversed(raw)):
+                    if RF_PULSE_MIN_US <= p <= RF_PULSE_MAX_US:
+                        last = i
+                        break
+                if first is not None and last is not None:
+                    end     = len(raw) if last == 0 else len(raw) - last
+                    trimmed = raw[first:end]
+                    captured = array.array('H', [])
+                    for p in trimmed:
+                        captured.append(p)
+                break
+
+    except Exception as e:
+        # Catch any hardware/allocation error so it doesn't propagate to the
+        # CircuitPython supervisor and silently restart code.py.
+        # 5 rapid white flashes = exception during recording (visible headless).
+        # Connect serial to read the error message.
+        exc_info = e
+        debug("RF record exception:", e)
+
     finally:
         rx.pause()
         rx.deinit()
@@ -187,12 +219,14 @@ def record_433_signal(key_combo):
     hold_yellow_active = False
     recording_key      = None
 
-    if captured is not None:
+    if exc_info is not None:
+        flash_led(50, 50, 50, times=5, on_ms=60, off_ms=60)  # white x5 = exception
+    elif captured is not None:
         RF_SIGNALS[key_combo] = captured
-        print("RF record: captured", len(captured), "pulses -> saved to", key_combo)
+        debug("RF record: captured", len(captured), "pulses -> saved to", key_combo)
         flash_led(50, 50, 0, times=2)  # two yellow flashes = success
     else:
-        print("RF record: timeout -- no signal detected")
+        debug("RF record: timeout -- no signal detected")
         flash_led(0, 50, 0, times=3)   # three red flashes = failure
 
     led_off()
@@ -202,7 +236,7 @@ def record_433_signal(key_combo):
 # Transmits a previously recorded pulse train on RF_TX_PIN.
 # ==============================================================================
 def replay_433_signal(pulses):
-    print("RF replay:", len(pulses), "pulses,", RF_REPLAY_TIMES, "times")
+    debug("RF replay:", len(pulses), "pulses,", RF_REPLAY_TIMES, "times")
     led(0, 0, 50)  # brief blue while transmitting
     try:
         tx = pulseio.PulseOut(RF_TX_PIN, frequency=RF_CARRIER_HZ,
@@ -213,7 +247,7 @@ def replay_433_signal(pulses):
             time.sleep(0.01)
         tx.deinit()
     except Exception as e:
-        print("RF replay error:", e)
+        debug("RF replay error:", e)
     led_off()
 
 # ==============================================================================
@@ -232,21 +266,21 @@ def detect_endpoint(dev):
     report_has_id=False -> [modifier, reserved, kc0..kc5]
     """
     probe = bytearray(8)
-    print("Press any key on the keyboard to complete detection...")
+    debug("Press any key on the keyboard to complete detection...")
 
     for ep in CANDIDATE_ENDPOINTS:
         try:
             dev.read(ep, probe, timeout=0)   # blocks until a report arrives
             has_id = (probe[0] in range(1, 10)) and (probe[2] == 0x00)
-            print("Endpoint found:", hex(ep), "| Report ID prefix:", has_id)
-            print("Sample report:", list(probe))
+            debug("Endpoint found:", hex(ep), "| Report ID prefix:", has_id)
+            debug("Sample report:", list(probe))
             return ep, has_id
         except usb.core.USBTimeoutError:
-            print("No response on", hex(ep), "-- trying next...")
+            debug("No response on", hex(ep), "-- trying next...")
         except Exception as e:
-            print("Probe error on", hex(ep), ":", e)
+            debug("Probe error on", hex(ep), ":", e)
 
-    print("No endpoint responded, defaulting to 0x81")
+    debug("No endpoint responded, defaulting to 0x81")
     return 0x81, False
 
 # ==============================================================================
@@ -268,15 +302,15 @@ def connect_keyboard():
     led_off()
 
     if dev is None:
-        print("No USB device found on host port")
+        debug("No USB device found on host port")
         return None, None, False
 
     # Stage 2: configure -- errors here are normal, do not abort
     try:
         dev.set_configuration()
-        print("Device configured:", dev.manufacturer, dev.product)
+        debug("Device configured:", dev.manufacturer, dev.product)
     except Exception as e:
-        print("set_configuration (non-fatal, continuing):", e)
+        debug("set_configuration (non-fatal, continuing):", e)
 
     # Stage 3: endpoint detection
     ep, has_id = detect_endpoint(dev)
@@ -284,7 +318,7 @@ def connect_keyboard():
     # Stage 4: ready (two yellow flashes)
     flash_led(50, 50, 0, times=2)
     prev_buf[:] = bytearray(8)
-    print("Connected: endpoint", hex(ep), "report_has_id:", has_id)
+    debug("Connected: endpoint", hex(ep), "report_has_id:", has_id)
     return dev, ep, has_id
 
 # ==============================================================================
@@ -335,7 +369,7 @@ def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
                 hold_yellow_active = False
                 recording_key      = None
                 led_off()
-                print("New key press: LED cleared")
+                debug("New key press: LED cleared")
             hold_start_time = time.monotonic()
         # If keycodes is empty the user just released; leave the LED and
         # timer completely untouched so yellow stays lit if it was on.
@@ -351,13 +385,13 @@ def update_hold_state(keycodes, prev_keycodes, modifier, prev_modifier):
             # always a single (modifier, kc) pair.
             recording_key = (modifier, min(keycodes))
             led(50, 50, 0)  # solid yellow
-            print("Key held for 4 s: LED solid yellow, will record RF for",
+            debug("Key held for 4 s: LED solid yellow, will record RF for",
                   recording_key)
 
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
-print("Starting -- waiting for USB keyboard on host port...")
+debug("Starting -- waiting for USB keyboard on host port...")
 
 kbd_dev       = None
 hid_endpoint  = None
@@ -380,7 +414,17 @@ while True:
     # while we wait for the incoming RF signal.
     # --------------------------------------------------------------------------
     if recording_key is not None:
-        record_433_signal(recording_key)
+        try:
+            record_433_signal(recording_key)
+        except Exception as e:
+            # Last-resort catch: record_433_signal should never raise, but if
+            # something slips through, recover gracefully instead of letting
+            # the CircuitPython supervisor restart code.py silently.
+            debug("Unhandled exception in record_433_signal:", e)
+            flash_led(50, 50, 50, times=10, on_ms=40, off_ms=40)  # white x10 = outer crash
+            hold_yellow_active = False
+            recording_key      = None
+            led_off()
         # recording_key and hold_yellow_active are cleared inside the function.
         # Flush prev_buf so the key-release that follows doesn't look like a
         # spurious state change.
@@ -395,7 +439,7 @@ while True:
         # 4-second threshold, so fall through using the unchanged buffer.
         pass
     except Exception as e:
-        print("Read error (disconnected?):", e)
+        debug("Read error (disconnected?):", e)
         kbd_dev            = None
         hid_endpoint       = None
         hold_start_time    = None

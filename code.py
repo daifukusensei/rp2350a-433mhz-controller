@@ -6,16 +6,24 @@ Requires in /lib:
   neopixel.mpy
 
 Requires boot.py on CIRCUITPY root:
-  import usb_host, board
+  import usb_host, board, storage
   usb_host.Port(board.GP12, board.GP13)
+  storage.remount("/", readonly=False)   # <-- NEW: allows file writes
 
 433 MHz wiring:
   RX data pin -> GP28
   TX data pin -> GP29  (change RF_TX_PIN below if different)
+
+Signal persistence:
+  Recorded signals are saved to /signals/<name>.sig on the CIRCUITPY flash.
+  Files are plain binary dumps of the array.array('H', ...) pulse train.
+  They are loaded automatically at boot so signals survive power cycles.
+  Filename examples:  A.sig  B.sig  SHIFT_A.sig  CTRL_F1.sig
 """
 
 import array
 import board
+import os
 import time
 import neopixel
 import pulseio
@@ -90,6 +98,188 @@ MOD_RCTRL  = 0x10
 MOD_RSHIFT = 0x20
 MOD_RALT   = 0x40
 MOD_RGUI   = 0x80
+
+# ==============================================================================
+# SIGNAL FILE PERSISTENCE
+# ==============================================================================
+SIGNALS_DIR = "/signals"
+
+# HID Usage ID -> human-readable name used for the filename stem.
+# Add more entries here if you use keys not yet listed.
+KEYCODE_NAMES = {
+    # Letters
+    0x04: "A",  0x05: "B",  0x06: "C",  0x07: "D",
+    0x08: "E",  0x09: "F",  0x0A: "G",  0x0B: "H",
+    0x0C: "I",  0x0D: "J",  0x0E: "K",  0x0F: "L",
+    0x10: "M",  0x11: "N",  0x12: "O",  0x13: "P",
+    0x14: "Q",  0x15: "R",  0x16: "S",  0x17: "T",
+    0x18: "U",  0x19: "V",  0x1A: "W",  0x1B: "X",
+    0x1C: "Y",  0x1D: "Z",
+    # Digits (top-row)
+    0x1E: "1",  0x1F: "2",  0x20: "3",  0x21: "4",  0x22: "5",
+    0x23: "6",  0x24: "7",  0x25: "8",  0x26: "9",  0x27: "0",
+    # Common keys
+    0x28: "ENTER",  0x29: "ESC",   0x2A: "BACKSPACE", 0x2B: "TAB",
+    0x2C: "SPACE",  0x2D: "MINUS", 0x2E: "EQUALS",
+    0x2F: "LBRACE", 0x30: "RBRACE",0x31: "BACKSLASH",
+    0x33: "SEMICOLON", 0x34: "QUOTE", 0x36: "COMMA",
+    0x37: "PERIOD", 0x38: "SLASH",
+    # Function keys
+    0x3A: "F1",  0x3B: "F2",  0x3C: "F3",  0x3D: "F4",
+    0x3E: "F5",  0x3F: "F6",  0x40: "F7",  0x41: "F8",
+    0x42: "F9",  0x43: "F10", 0x44: "F11", 0x45: "F12",
+    # Navigation / editing
+    0x47: "SCROLLLOCK", 0x49: "INSERT", 0x4A: "HOME",
+    0x4B: "PAGEUP", 0x4C: "DELETE", 0x4D: "END", 0x4E: "PAGEDOWN",
+    0x4F: "RIGHT", 0x50: "LEFT",  0x51: "DOWN",  0x52: "UP",
+    # Numpad
+    0x53: "NUM_LOCK", 0x54: "KP_SLASH", 0x55: "KP_STAR",
+    0x56: "KP_MINUS", 0x57: "KP_PLUS",  0x58: "KP_ENTER",
+    0x59: "KP_1", 0x5A: "KP_2", 0x5B: "KP_3", 0x5C: "KP_4",
+    0x5D: "KP_5", 0x5E: "KP_6", 0x5F: "KP_7", 0x60: "KP_8",
+    0x61: "KP_9", 0x62: "KP_0", 0x63: "KP_DOT",
+}
+
+# Modifier flags -> short prefix string (only non-zero combinations get a prefix)
+_MOD_PARTS = [
+    (MOD_LCTRL | MOD_RCTRL,  "CTRL"),
+    (MOD_LSHIFT | MOD_RSHIFT, "SHIFT"),
+    (MOD_LALT | MOD_RALT,    "ALT"),
+    (MOD_LGUI | MOD_RGUI,    "GUI"),
+]
+
+def _modifier_prefix(modifier):
+    """Return a string like 'CTRL_SHIFT_' for the active modifier bits, or ''."""
+    parts = []
+    for mask, name in _MOD_PARTS:
+        if modifier & mask:
+            parts.append(name)
+    return "_".join(parts) + "_" if parts else ""
+
+def key_combo_to_filename(key_combo):
+    """
+    Convert (modifier, keycode) to a safe filename stem.
+    Examples:
+      (0x00, 0x04) -> "A"
+      (0x02, 0x04) -> "SHIFT_A"
+      (0x01, 0x3B) -> "CTRL_F2"
+      (0x00, 0xFF) -> "KEY_FF"   (unknown keycode fallback)
+    """
+    modifier, keycode = key_combo
+    key_name = KEYCODE_NAMES.get(keycode, "KEY_{:02X}".format(keycode))
+    return _modifier_prefix(modifier) + key_name
+
+def _ensure_signals_dir():
+    """Create /signals directory if it doesn't exist yet."""
+    try:
+        os.stat(SIGNALS_DIR)
+    except OSError:
+        os.mkdir(SIGNALS_DIR)
+
+def save_signal(key_combo, pulses, comment=""):
+    """
+    Persist *pulses* (array.array('H')) to SIGNALS_DIR/<n>.sig as plain text.
+    Each pulse width is written as one integer per line (microseconds).
+    Lines beginning with '#' are comments and are ignored on load.
+
+    A '# Key: <n>' line is always written automatically.  Pass an optional
+    comment string to include a second comment line, e.g.:
+        save_signal(key_combo, pulses, comment="garage door opener")
+
+    To annotate a recording later, open the .sig file in any text editor and
+    freely add or edit '#' lines -- they survive reloads unchanged.
+    Overwrites any previous recording for the same key.
+
+    Example  signals/A.sig:
+      # Key: A
+      # garage door opener
+      560
+      1680
+      560
+      ...
+    """
+    _ensure_signals_dir()
+    name = key_combo_to_filename(key_combo)
+    path = SIGNALS_DIR + "/" + name + ".sig"
+    try:
+        with open(path, "w") as f:
+            f.write("# Key: {}\n".format(name))
+            if comment:
+                f.write("# {}\n".format(comment))
+            for p in pulses:
+                f.write("{}\n".format(p))
+        debug("Signal saved to", path, "(", len(pulses), "pulses )")
+    except Exception as e:
+        debug("save_signal failed for", path, ":", e)
+def load_all_signals():
+    """
+    Read every *.sig file from SIGNALS_DIR and populate RF_SIGNALS.
+    The filename stem is matched against KEYCODE_NAMES (and modifier prefix)
+    in reverse to reconstruct the (modifier, keycode) key.
+    Falls back to storing by filename if reverse-mapping fails.
+
+    Called once at startup so recorded signals survive power cycles.
+    """
+    # Build a reverse map:  "CTRL_A"  ->  (0x01, 0x04)
+    reverse = {}
+    for kc, kname in KEYCODE_NAMES.items():
+        # No-modifier version
+        reverse[kname] = (0x00, kc)
+        # All meaningful modifier combinations
+        for mod_mask, mod_name in _MOD_PARTS:
+            # Use only the canonical left-side bit for storage key consistency
+            lbit = mod_mask & 0x0F  # works because left bits are lower nibble
+            reverse[mod_name + "_" + kname] = (lbit, kc)
+        # Two-modifier combos (extend as needed)
+        for i, (m1, n1) in enumerate(_MOD_PARTS):
+            for m2, n2 in _MOD_PARTS[i+1:]:
+                lb1 = m1 & 0x0F
+                lb2 = m2 & 0x0F
+                reverse[n1 + "_" + n2 + "_" + kname] = (lb1 | lb2, kc)
+
+    _ensure_signals_dir()
+    try:
+        entries = os.listdir(SIGNALS_DIR)
+    except OSError:
+        debug("load_all_signals: could not list", SIGNALS_DIR)
+        return
+
+    loaded = 0
+    for fname in entries:
+        if not fname.endswith(".sig"):
+            continue
+        stem = fname[:-4]                       # strip ".sig"
+        path = SIGNALS_DIR + "/" + fname
+        try:
+            with open(path, "r") as f:
+                lines = f.read().splitlines()
+            values = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue          # skip comments and blank lines
+                try:
+                    values.append(int(line))
+                except ValueError:
+                    debug("load_all_signals: ignoring bad line in", fname, ":", line)
+            pulses = array.array('H', values)
+            key_combo = reverse.get(stem)
+            if key_combo is None:
+                # Unknown name -- store under a dummy key so it isn't lost
+                debug("load_all_signals: no reverse mapping for", stem,
+                      "-- skipping (re-record to fix)")
+                continue
+            RF_SIGNALS[key_combo] = pulses
+            debug("Loaded signal", path, "->", key_combo,
+                  "(", len(pulses), "pulses )")
+            loaded += 1
+        except Exception as e:
+            debug("load_all_signals: error reading", fname, ":", e)
+
+    debug("Loaded", loaded, "signal(s) from", SIGNALS_DIR)
+
+# Load persisted signals before anything else runs
+load_all_signals()
 
 # ==============================================================================
 # CUSTOM ACTIONS
@@ -223,6 +413,7 @@ def record_433_signal(key_combo):
         flash_led(50, 50, 50, times=5, on_ms=60, off_ms=60)  # white x5 = exception
     elif captured is not None:
         RF_SIGNALS[key_combo] = captured
+        save_signal(key_combo, captured)           # <-- persist to flash
         debug("RF record: captured", len(captured), "pulses -> saved to", key_combo)
         flash_led(50, 50, 0, times=2)  # two yellow flashes = success
     else:

@@ -442,37 +442,48 @@ def replay_433_signal(pulses):
     led_off()
 
 # ==============================================================================
-# ENDPOINT AUTO-DETECTION
+# ENDPOINT AUTO-DETECTION  (descriptor-based)
 # ==============================================================================
-CANDIDATE_ENDPOINTS = [0x81, 0x82, 0x83, 0x84]
+USB_CLASS_HID      = 0x03
+EP_ATTR_INTERRUPT  = 0x03
+EP_DIR_IN          = 0x80
 
 def detect_endpoint(dev):
     """
-    Block on each candidate endpoint waiting for the first keypress (timeout=0
-    means wait forever in CircuitPython's usb.core -- NOT zero milliseconds).
-    A USBTimeoutError means the endpoint doesn't exist on this device; move on.
-    Any other exception also means this endpoint isn't valid; move on.
-    Returns (endpoint, report_has_id).
-    report_has_id=True  -> [report_id, modifier, reserved, kc0..kc4]
-    report_has_id=False -> [modifier, reserved, kc0..kc5]
+    Walk USB configuration → interface → endpoint descriptors to find the
+    first HID interrupt-IN endpoint. The device announces its own layout
+    in its descriptors.
+
+    Falls back to 0x81 if nothing suitable is found.
+    report_has_id is always False (correct for all standard USB keyboards).
     """
-    probe = bytearray(8)
-    debug("Press any key on the keyboard to complete detection...")
+    found_ep = None
 
-    for ep in CANDIDATE_ENDPOINTS:
-        try:
-            dev.read(ep, probe, timeout=0)   # blocks until a report arrives
-            has_id = (probe[0] in range(1, 10)) and (probe[2] == 0x00)
-            debug("Endpoint found:", hex(ep), "| Report ID prefix:", has_id)
-            debug("Sample report:", list(probe))
-            return ep, has_id
-        except usb.core.USBTimeoutError:
-            debug("No response on", hex(ep), "-- trying next...")
-        except Exception as e:
-            debug("Probe error on", hex(ep), ":", e)
+    try:
+        for cfg in dev:
+            for intf in cfg:
+                if intf.bInterfaceClass != USB_CLASS_HID:
+                    continue
+                for ep in intf:
+                    is_interrupt = (ep.bmAttributes & 0x03) == EP_ATTR_INTERRUPT
+                    is_in        = bool(ep.bEndpointAddress & EP_DIR_IN)
+                    if is_interrupt and is_in:
+                        found_ep = ep.bEndpointAddress
+                        debug("HID interrupt-IN endpoint found via descriptor:",
+                              hex(found_ep))
+                        break
+                if found_ep is not None:
+                    break
+            if found_ep is not None:
+                break
+    except Exception as e:
+        debug("Descriptor walk error (non-fatal):", e)
 
-    debug("No endpoint responded, defaulting to 0x81")
-    return 0x81, False
+    if found_ep is None:
+        debug("No HID endpoint in descriptors, falling back to 0x81")
+        found_ep = 0x81
+
+    return found_ep, False
 
 # ==============================================================================
 # USB HOST: FIND AND CONNECT TO KEYBOARD

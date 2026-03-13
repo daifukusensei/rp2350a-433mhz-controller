@@ -1,4 +1,4 @@
-# RF Outlet Controller
+# Waveshare RP2350A 433 MHz Universal RF Controller
 
 Control 433 MHz radio-frequency (RF) devices like outlets with a standard USB keyboard, using a Waveshare RP2350A microcontroller running CircuitPython.
 
@@ -16,7 +16,7 @@ Signals from each button of the RF remote must first be **recorded** once to a d
 
 ## What you need
 
-- Waveshare RP2350A running CircuitPython 10.x
+- Waveshare RP2350A running CircuitPython 10.x (can likely work with other RP2350 devices with USB host support)
 - A 433 MHz receiver module (XY-MK-5V) wired to **GP28**
 - A 433 MHz transmitter module (FS1000A) wired to **GP29**
 - A USB keyboard plugged into the RP2350A's USB host port

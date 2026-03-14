@@ -8,9 +8,7 @@ I built this as a replacement for the remotes of the various brands of RF outlet
 
 ## How it works
 
-The device sits between a USB keyboard and your computer (or just runs standalone on USB power). It listens for key presses and, when it recognises one it knows, fires the matching 433 MHz signal to your RF outlet-- the same signal your original remote would send.
-
-Signals from each button of the RF remote must first be **recorded** once to a designated key on the keyboard.
+The RP2350A sits between a USB keyboard and your computer (or USB power supply). As with an old-school universal TV remote control, button presses of the target device's RF remote are first recorded to individual keys on your keyboard-- a resulting keypress then duplicates the same function as performed by the RF remote.
 
 ---
 

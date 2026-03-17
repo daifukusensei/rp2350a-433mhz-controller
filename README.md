@@ -2,13 +2,17 @@
 
 Control 433 MHz radio-frequency (RF) devices like outlets with a standard USB keyboard, using a Waveshare RP2350A microcontroller running CircuitPython.
 
+<p align="center">
+  <img width="400" alt="image" src="https://github.com/user-attachments/assets/c794544b-a42c-437f-8f0d-c70990d79b4e" />
+</p>
+
 I built this as a replacement for the remotes of the various brands of RF outlets I have around the house, in order to control all from a single keyboard.
 
 ---
 
 ## How it works
 
-The RP2350A sits between a USB keyboard and your computer (or USB power supply). As with an old-school universal TV remote control, button presses of the target device's RF remote are first recorded to individual keys on your keyboard-- a resulting keypress then duplicates the same function as performed by that button on the RF remote.
+The RP2350A sits between a USB keyboard and your computer (or headless, via dedicated USB power supply). As with a universal TV remote, button presses from the device’s RF remote are first recorded to individual keys on your keyboard, allowing subsequent keypresses to duplicate the same function.
 
 ---
 

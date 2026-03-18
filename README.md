@@ -32,7 +32,8 @@ The RP2350A sits between a USB keyboard and your computer (or headless, via dedi
 |---|---|
 | `boot.py` | Runs at power-on. Sets up USB host mode and controls whether the board's storage is writable from a PC. |
 | `code.py` | The main program. Reads the keyboard, records RF signals, and replays them. |
-| `signals/` | Folder containing saved RF signals of products I currently use. |
+| `pcb/` | Gerber file and EasyEDA project used to manufacture a custom PCB, instead of using a breadboard (so-named 'Project Makemake', per planetary-body naming convention of [previous hardware-based repos of mine](https://github.com/daifukusensei/arduino-gps-logger)). |
+| `signals/` | RF signals of products I currently use. |
 
 ---
  

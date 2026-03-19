@@ -1,4 +1,4 @@
-# Waveshare RP2350A 433 MHz Universal RF Controller - EasyEDA Project and Gerber File
+# Waveshare RP2350-USB-A 433 MHz Universal RF Controller - EasyEDA Project and Gerber File
 
 <p align="center">
   <img width="281" height="255" alt="image" src="https://github.com/user-attachments/assets/2cdd8b3d-3cfa-48b4-b0ae-ef7b1c14eb9d" />

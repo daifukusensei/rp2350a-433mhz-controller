@@ -1,6 +1,6 @@
-# Waveshare RP2350A 433 MHz Universal RF Controller
+# Waveshare RP2350-USB-A 433 MHz Universal RF Controller
 
-Control 433 MHz radio-frequency (RF) devices like outlets with a standard USB keyboard, using a Waveshare RP2350A microcontroller running CircuitPython.
+Control 433 MHz radio-frequency (RF) devices like outlets with a standard USB keyboard, using a Waveshare RP2350-USB-A microcontroller running CircuitPython.
 
 <p align="center">
   <img width="400" alt="image" src="https://github.com/user-attachments/assets/c794544b-a42c-437f-8f0d-c70990d79b4e" />
@@ -12,16 +12,16 @@ I built this as a replacement for the remotes of the various brands of RF outlet
 
 ## How it works
 
-The RP2350A sits between a USB keyboard and your computer (or headless, via dedicated USB power supply). As with a universal TV remote, button presses from the device’s RF remote are first recorded to individual keys on your keyboard, allowing subsequent keypresses to duplicate the same function.
+The RP2350-USB-A sits between a USB keyboard and your computer (or headless, via dedicated USB power supply). As with a universal TV remote, button presses from the device’s RF remote are first recorded to individual keys on your keyboard, allowing subsequent keypresses to duplicate the same function.
 
 ---
 
 ## What you need
 
-- Waveshare RP2350A running CircuitPython 10.x (can likely work with other RP2350 devices with USB host support)
+- Waveshare RP2350-USB-A running CircuitPython 10.x (can likely work with other RP2350 devices with USB host support)
 - A 433 MHz receiver module (XY-MK-5V) wired to **GP28**
 - A 433 MHz transmitter module (FS1000A) wired to **GP29**
-- A USB keyboard plugged into the RP2350A's USB host port
+- A USB keyboard plugged into the RP2350-USB-A's USB host port
 - The `neopixel.mpy` library present in `/lib` on the board
 
 ---
@@ -80,10 +80,10 @@ CIRCUITPY/
 
 ## Recording a new signal
 
-1. Connect your keyboard and power the RP2350A.
+1. Connect your keyboard and power the RP2350-USB-A.
 2. **Hold down the key** you want to assign (e.g. `A`, `SHIFT+1`, `F3`) for **4 seconds**.
-3. The RP2350A's LED turns **solid yellow**, and the board is now listening for an RF signal.
-4. **Press and hold the button on your original remote** while close to the RP2350A and receiver. 
+3. The RP2350-USB-A's LED turns **solid yellow**, and the board is now listening for an RF signal.
+4. **Press and hold the button on your original remote** while close to the RP2350-USB-A and receiver. 
 5. The LED flashes **yellow twice** on success, or **red three times** if it timed out (try again).
 
 The signal is saved automatically to the `signals/` folder, named after the key you've recorded it to, and re-assigned to the same key automatically across power-cycles. For example, `A.sig` or `SHIFT_F1.sig`. It can be opened in a text editor if you want to add a label or note, or backed up.

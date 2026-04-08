@@ -106,7 +106,7 @@ The `signals/` folder contains recordings for a few products I currently own. Fe
 
 By default, the board's storage is **not writable from your PC** while the main program is running (this is required so the program itself can save new recordings).
 
-To copy files to or from your PC, **hold the button on GP15 while plugging in** the USB cable. This puts the board into PC-writable mode, and the `CIRCUITPY` drive will appear as normal on your computer. You can then drag `.sig` files in or out of the `signals/` folder freely.
+To copy files to or from your PC, **double-tap the RST button** (two deliberate taps, roughly one second apart as double-tapping too fast enters the UF2 bootloader instead). The LED will pulse green to confirm safe mode. In this mode, neither `boot.py` nor `code.py` runs, so the board presents a normal writable `CIRCUITPY` drive on your computer. You can then drag `.sig` files in or out of the `signals/` folder freely. Unplug and replug to return to normal operation.
 
 ---
 
